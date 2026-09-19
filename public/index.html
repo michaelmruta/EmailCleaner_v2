@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EmailCleaner v2</title>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body x-data="app()" x-init="init()">
+
+  <!-- ── Login Modal ───────────────────────────────────────────────────── -->
+  <div class="modal-overlay" x-show="!connected" x-cloak>
+    <div class="modal">
+      <div class="modal-logo">✉</div>
+      <h2>EmailCleaner <span class="v2">v2</span></h2>
+      <p class="modal-sub">Reorganize your Yahoo inbox in realtime</p>
+      <div x-show="restoringSession" class="modal-sub">Restoring session…</div>
+      <form @submit.prevent="connect" x-show="!restoringSession">
+        <div class="field">
+          <label>Yahoo Email</label>
+          <input type="email" x-model="form.email" placeholder="you@yahoo.com" required autocomplete="username" />
+        </div>
+        <div class="field">
+          <label>App Password</label>
+          <input type="password" x-model="form.password" placeholder="xxxx-xxxx-xxxx-xxxx" required autocomplete="current-password" />
+          <span class="field-hint">Yahoo → Security → App Passwords</span>
+        </div>
+        <button type="submit" class="btn btn-primary btn-full" :disabled="connecting">
+          <span x-show="!connecting">Connect</span>
+          <span x-show="connecting">Connecting…</span>
+        </button>
+        <p class="error-msg" x-show="authError" x-text="authError"></p>
+      </form>
+    </div>
+  </div>
+
+  <!-- ── Main App ──────────────────────────────────────────────────────── -->
+  <div class="app" x-show="connected" x-cloak>
+
+    <!-- Header -->
+    <header class="header">
+      <div class="header-left">
+        <span class="logo">✉ EmailCleaner <span class="v2">v2</span></span>
+      </div>
+      <div class="header-right">
+        <span class="dot dot-green"></span>
+        <span class="connected-label" x-text="userEmail"></span>
+        <button class="btn btn-ghost btn-sm" @click="openSettings()">⚙ AI Settings</button>
+        <button class="btn btn-ghost btn-sm" @click="disconnect">Disconnect</button>
+      </div>
+    </header>
+
+    <!-- ── AI Settings Modal ────────────────────────────────────────────── -->
+    <div class="modal-overlay" x-show="showSettings" x-cloak @click.self="showSettings = false">
+      <div class="modal">
+        <h2>AI Classifier</h2>
+        <p class="modal-sub">Used for emails the rule engine can't confidently sort</p>
+
+        <div class="field">
+          <label>Provider</label>
+          <select x-model="aiConfig.provider" @change="onProviderChange()">
+            <template x-for="p in aiProviders" :key="p.id">
+              <option :value="p.id" x-text="p.id + (p.configured ? '' : ' (no API key set)')"></option>
+            </template>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Model</label>
+          <div class="field-hint" x-show="loadingModels">Loading models…</div>
+          <select x-show="!loadingModels && aiModels.length" x-model="aiConfig.model">
+            <template x-for="m in aiModels" :key="m">
+              <option :value="m" x-text="m"></option>
+            </template>
+          </select>
+          <input x-show="!loadingModels && !aiModels.length" type="text" x-model="aiConfig.model" placeholder="model name" />
+          <span class="field-hint" x-show="aiConfig.provider === 'ollama'">Auto-detected from your local Ollama instance</span>
+          <p class="error-msg" x-show="aiModelsError" x-text="aiModelsError"></p>
+        </div>
+
+        <button class="btn btn-primary btn-full" @click="saveAiConfig()">Save</button>
+      </div>
+    </div>
+
+    <!-- ── Process Card + ETA Card ──────────────────────────────────────── -->
+    <div class="process-row">
+      <div class="process-card">
+        <div class="process-top">
+          <div class="process-title-row">
+            <span class="process-title">INBOX Clean-up</span>
+            <span class="status-badge" :class="'badge-' + process.status" x-text="process.status"></span>
+          </div>
+          <div class="process-counts">
+            <span x-text="fmt(process.done)"></span>
+            <span class="muted"> / </span>
+            <span x-text="process.total ? fmt(process.total) : '—'"></span>
+            <span class="pct-label" x-show="process.total" x-text="' · ' + pct(process.done, process.total) + '%'"></span>
+          </div>
+        </div>
+
+        <div class="progress-bar">
+          <div class="progress-fill"
+               :class="{ 'progress-fill-done': process.status === 'done' }"
+               :style="{ width: pct(process.done, process.total) + '%' }">
+          </div>
+        </div>
+
+        <!-- Current action line -->
+        <div class="current-action" x-show="process.currentAction" x-text="process.currentAction"></div>
+
+        <!-- Throughput -->
+        <div class="current-action" x-show="process.status === 'running' && process.perSec">
+          <span x-text="fmtRate(process.perSec)"></span>
+          <span class="muted"> throughput</span>
+        </div>
+
+        <div class="process-controls">
+          <button class="btn btn-primary btn-sm"
+            x-show="['idle','stopped'].includes(process.status)"
+            @click="apiPost('/api/process/start')">▶ Start</button>
+          <button class="btn btn-primary btn-sm"
+            x-show="process.status === 'paused'"
+            @click="apiPost('/api/process/resume')">▶ Resume (<span x-text="fmt(process.done)"></span> done)</button>
+          <button class="btn btn-warning btn-sm"
+            x-show="process.status === 'running'"
+            @click="apiPost('/api/process/pause')">⏸ Pause</button>
+          <button class="btn btn-danger btn-sm"
+            x-show="['running','paused'].includes(process.status)"
+            @click="apiPost('/api/process/stop')">⏹ Stop</button>
+          <span class="done-label" x-show="process.status === 'done'">✓ Done</span>
+          <div style="flex:1"></div>
+          <button class="btn btn-ghost btn-sm"
+            x-show="!['running','paused'].includes(process.status)"
+            @click="confirmReset()">↺ Reset</button>
+        </div>
+      </div>
+
+      <!-- ── ETA Card ──────────────────────────────────────────────────── -->
+      <div class="eta-card">
+        <div class="eta-label">Est. Time Remaining</div>
+
+        <template x-if="clientStats().etaSeconds !== null">
+          <div class="eta-countdown">
+            <div class="eta-segment">
+              <span class="eta-num" x-text="etaParts(clientStats().etaSeconds).d"></span>
+              <span class="eta-unit">d</span>
+            </div>
+            <div class="eta-segment">
+              <span class="eta-num" x-text="etaParts(clientStats().etaSeconds).h"></span>
+              <span class="eta-unit">h</span>
+            </div>
+            <div class="eta-segment">
+              <span class="eta-num" x-text="etaParts(clientStats().etaSeconds).m"></span>
+              <span class="eta-unit">m</span>
+            </div>
+          </div>
+        </template>
+        <div class="eta-dash" x-show="clientStats().etaSeconds === null">—</div>
+
+        <div class="eta-progress" x-show="process.grandTotal && process.grandRemaining !== null">
+          <span x-text="fmt(process.grandTotal - process.grandRemaining)"></span>
+          <span class="muted"> / </span>
+          <span x-text="fmt(process.grandTotal)"></span>
+          <span class="muted"> done</span>
+          <span class="pct-label" x-text="' · ' + pct(process.grandTotal - process.grandRemaining, process.grandTotal) + '%'"></span>
+        </div>
+
+        <div class="mini-progress-bar" x-show="process.grandTotal && process.grandRemaining !== null">
+          <div class="mini-progress-fill"
+               :class="{ 'progress-fill-done': process.status === 'done' }"
+               :style="{ width: pct(process.grandTotal - process.grandRemaining, process.grandTotal) + '%' }">
+          </div>
+        </div>
+
+        <div class="eta-hint muted" x-show="clientStats().etaSeconds !== null">
+          <span x-text="fmtRate(clientStats().perSec) + ' processed'"></span>
+          <span> · </span>
+          <span x-text="'~' + fmtEta(clientStats().etaSeconds) + ' remaining'"></span>
+        </div>
+
+        <div class="eta-elapsed muted" x-show="clientStats().elapsedSeconds !== null"
+             x-text="'Elapsed ' + fmtEta(clientStats().elapsedSeconds)"></div>
+      </div>
+    </div>
+
+    <!-- ── Stats Bar ─────────────────────────────────────────────────── -->
+    <div class="stats-bar">
+      <div class="stat-item">
+        <span class="stat-icon">📁</span>
+        <span class="stat-label">Moved</span>
+        <span class="stat-value mov" x-text="fmt(process.moved)"></span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-icon">🗑</span>
+        <span class="stat-label">Deleted</span>
+        <span class="stat-value del" x-text="fmt(process.deleted)"></span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-icon">💾</span>
+        <span class="stat-label">Saved (mbox)</span>
+        <span class="stat-value sav" x-text="fmt(process.saved)"></span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-icon">📬</span>
+        <span class="stat-label">Remaining</span>
+        <span class="stat-value" x-text="process.total ? fmt(Math.max(0, process.total - process.done)) : '—'"></span>
+      </div>
+    </div>
+
+    <!-- ── Tabs ───────────────────────────────────────────────────────── -->
+    <div class="tabs">
+      <button class="tab" :class="{ active: tab === 'dashboard' }" @click="tab = 'dashboard'">Dashboard</button>
+      <button class="tab" :class="{ active: tab === 'rules' }" @click="tab = 'rules'; loadRules()">
+        Rules (<span x-text="rules ? (rules.domains.length + rules.keywords.length + rules.subjects.length) : '…'"></span>)
+      </button>
+    </div>
+
+    <!-- ── Dashboard ─────────────────────────────────────────────────── -->
+    <div class="panels" x-show="tab === 'dashboard'">
+
+      <!-- Live Activity Feed -->
+      <div class="panel panel-feed">
+        <div class="panel-header">
+          <span>Live Activity</span>
+          <button class="btn btn-ghost btn-xs" @click="feed = []">Clear</button>
+        </div>
+        <div class="feed-list" id="feed-list">
+          <template x-for="item in feed" :key="item.uid + (item.action || '')">
+            <div class="feed-item" :class="feedClass(item.action)">
+              <div class="feed-meta">
+                <span class="feed-from" x-text="truncate(item.from, 30)"></span>
+                <span class="feed-source" x-text="item.source || ''"></span>
+              </div>
+              <div class="feed-subject" x-text="truncate(item.subject, 55)"></div>
+              <div class="feed-action">
+                <template x-if="item.action === 'move'">
+                  <span class="tag tag-move">📁 <span x-text="item.folder"></span></span>
+                </template>
+                <template x-if="item.action === 'delete'">
+                  <span class="tag tag-delete">🗑 DELETE</span>
+                </template>
+                <template x-if="item.action === 'save'">
+                  <span class="tag tag-save">💾 mbox</span>
+                </template>
+              </div>
+            </div>
+          </template>
+          <div class="feed-empty" x-show="feed.length === 0">Waiting for activity…</div>
+        </div>
+      </div>
+
+      <!-- Right column -->
+      <div class="panel-right">
+
+        <!-- Folder Breakdown -->
+        <div class="panel panel-folders">
+          <div class="panel-header">Folder Breakdown</div>
+          <div class="folder-list">
+            <template x-if="process.deleted > 0">
+              <div class="folder-row">
+                <span class="folder-name del">🗑 DELETED</span>
+                <div class="folder-bar-wrap">
+                  <div class="folder-bar folder-bar-del" :style="{ width: barPct(process.deleted) + '%' }"></div>
+                </div>
+                <span class="folder-count del" x-text="fmt(process.deleted)"></span>
+              </div>
+            </template>
+            <template x-if="process.saved > 0">
+              <div class="folder-row">
+                <span class="folder-name sav">💾 mbox</span>
+                <div class="folder-bar-wrap">
+                  <div class="folder-bar folder-bar-sav" :style="{ width: barPct(process.saved) + '%' }"></div>
+                </div>
+                <span class="folder-count sav" x-text="fmt(process.saved)"></span>
+              </div>
+            </template>
+            <template x-for="[folder, count] in sortedFolders()" :key="folder">
+              <div class="folder-row">
+                <span class="folder-name" x-text="folder"></span>
+                <div class="folder-bar-wrap">
+                  <div class="folder-bar" :style="{ width: barPct(count) + '%' }"></div>
+                </div>
+                <span class="folder-count" x-text="fmt(count)"></span>
+              </div>
+            </template>
+            <div class="feed-empty" x-show="process.moved === 0 && process.deleted === 0 && process.saved === 0">
+              No activity yet
+            </div>
+          </div>
+        </div>
+
+        <!-- Console -->
+        <div class="panel panel-log">
+          <div class="panel-header">
+            <span>Console</span>
+            <button class="btn btn-ghost btn-xs" @click="logs = []">Clear</button>
+          </div>
+          <div class="log-list" id="log-list">
+            <template x-for="(e, i) in logs" :key="i">
+              <div class="log-entry" :class="'log-' + e.level">
+                <span class="log-time" x-text="e.time"></span>
+                <span x-text="e.msg"></span>
+              </div>
+            </template>
+            <div class="feed-empty" x-show="logs.length === 0">No logs yet</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ── Rules ─────────────────────────────────────────────────────── -->
+    <div class="rules-panel" x-show="tab === 'rules'" x-cloak>
+      <div x-show="!rules" class="feed-empty">Loading…</div>
+      <template x-if="rules">
+        <div class="rules-grid">
+
+          <div class="panel">
+            <div class="panel-header">Domain Rules (<span x-text="rules.domains.length"></span>)</div>
+            <div class="rules-list">
+              <template x-for="r in rules.domains" :key="r.domain">
+                <div class="rule-row">
+                  <span class="rule-domain" x-text="r.domain"></span>
+                  <span class="rule-arrow">→</span>
+                  <span class="rule-folder" :class="r.folder === 'DELETE' ? 'tag-delete' : 'tag-move'" x-text="r.folder"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">Sender Keyword Rules (<span x-text="rules.keywords.length"></span>)</div>
+            <div class="rules-list">
+              <template x-for="(r, i) in rules.keywords" :key="i">
+                <div class="rule-row">
+                  <span class="rule-domain" x-text="r.match.join(', ')"></span>
+                  <span class="rule-arrow">→</span>
+                  <span class="rule-folder" :class="r.folder === 'DELETE' ? 'tag-delete' : 'tag-move'" x-text="r.folder"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">Subject Rules (<span x-text="rules.subjects.length"></span>)</div>
+            <div class="rules-list">
+              <template x-for="(r, i) in rules.subjects" :key="i">
+                <div class="rule-row">
+                  <span class="rule-pattern" x-text="r.pattern"></span>
+                  <span class="rule-arrow">→</span>
+                  <span class="rule-folder" :class="r.action === 'delete' ? 'tag-delete' : 'tag-move'"
+                        x-text="r.action === 'delete' ? 'DELETE: ' + r.reason : r.folder"></span>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">Header Rules + Marketing Mailers</div>
+            <div class="rules-list">
+              <div class="rule-row"><span class="rule-domain">List-Unsubscribe header</span><span class="rule-arrow">→</span><span class="rule-folder tag-delete">DELETE</span></div>
+              <div class="rule-row"><span class="rule-domain">Precedence: bulk / list</span><span class="rule-arrow">→</span><span class="rule-folder tag-delete">DELETE</span></div>
+              <div class="rule-row"><span class="rule-domain">X-Campaign-ID present</span><span class="rule-arrow">→</span><span class="rule-folder tag-delete">DELETE</span></div>
+              <div class="panel-header" style="margin-top:8px">Marketing Mailers</div>
+              <template x-for="m in rules.marketingMailers" :key="m">
+                <div class="rule-row">
+                  <span class="rule-domain" x-text="m"></span>
+                  <span class="rule-arrow">→</span>
+                  <span class="rule-folder tag-delete">DELETE</span>
+                </div>
+              </template>
+            </div>
+          </div>
+
+        </div>
+      </template>
+    </div>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
