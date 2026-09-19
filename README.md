@@ -25,11 +25,23 @@ anything the rules can't confidently classify.
 
 ```bash
 npm install
-cp .env.example .env   # fill in YAHOO_EMAIL / YAHOO_APP_PASSWORD (Yahoo → Security → App Passwords)
+cp .env.example .env   # fill in YAHOO_EMAIL / YAHOO_APP_PASSWORD
 npm start
 ```
 
 Open `http://localhost:3333`.
+
+### Getting a Yahoo App Password
+
+Yahoo requires an app-specific password for IMAP access — your regular
+account password won't work, and 2-step verification must be enabled first.
+
+1. Go to [Yahoo Account Security](https://login.yahoo.com/account/security).
+2. Enable **2-Step Verification** if it isn't already on.
+3. Click **Generate app password** (under "App passwords").
+4. Give it a name (e.g. `EmailCleaner`) and click **Generate**.
+5. Copy the 16-character password shown and paste it into `.env` as
+   `YAHOO_APP_PASSWORD` — Yahoo only shows it once.
 
 ## Performance
 
