@@ -1,6 +1,12 @@
 'use strict';
 
 function app() {
+  // Non-reactive cache for chartRender() — keyed on history length + newest
+  // sample timestamp, so it recomputes only when a new point lands, never on
+  // hover. Kept off the reactive object to avoid self-triggering effects.
+  let chartKey = null;
+  let chartCache = null;
+
   return {
     connected: false,
     userEmail: '',
@@ -10,19 +16,31 @@ function app() {
 
     form: { email: '', password: '' },
 
-    SESSION_KEY:   'ec_session',
-    RUN_START_KEY: 'ec_run_started_at',
-    LOGS_KEY:      'ec_logs',
+    SESSION_KEY: 'ec_session',
+    LOGS_KEY:    'ec_logs',
 
     process: {
-      status: 'idle', total: 0, done: 0, moved: 0, deleted: 0, saved: 0, currentAction: '',
+      status: 'idle', total: 0, done: 0, moved: 0, deleted: 0, saved: 0, llmProcessed: 0, currentAction: '',
       perSec: 0, etaSeconds: null, grandTotal: null, grandRemaining: null, grandEtaSeconds: null,
+      runStartedAt: null,
     },
     stats:   { folders: {} },
 
+    // ── Activity-over-time chart (client-sampled from progress events) ────
+    CHART_SERIES: [
+      { key: 'llmProcessed', label: 'LLM processed', color: 'var(--orange)' },
+      { key: 'moved',        label: 'Moved',         color: 'var(--green)' },
+      { key: 'deleted',      label: 'Deleted',       color: 'var(--red)' },
+      { key: 'saved',        label: 'mbox',          color: 'var(--teal)' },
+    ],
+    HISTORY_MAX: 600,       // ~20 min of history at the 2s sampling interval below
+    history: [],
+    _lastHistoryAt: 0,
+    hoverIdx: null,
+
     pipeline: {
       poolSize: 0, poolCapacity: 0, fetchChunk: 0, fetchTotalChunks: 0,
-      llmState: 'idle', llmStartedAt: null,
+      llmActive: 0, llmCapacity: 0, llmCallStartedAts: [],
     },
 
     feed: [],
@@ -31,7 +49,6 @@ function app() {
     tab: 'dashboard',
 
     _es: null,
-    runStartedAt: null, // wall-clock ms when the current run started (persists through pause/resume)
     now: Date.now(), // ticks every 250ms — reactive clock source for live elapsed timers
 
     // ── AI settings modal ───────────────────────────────────
@@ -45,10 +62,10 @@ function app() {
 
     // ── Init ──────────────────────────────────────────────
     async init() {
-      // Restore across page refreshes — the actual run start time (so elapsed
-      // time keeps counting from when the run really began) and the console log.
-      this.runStartedAt = this.loadRunStartedAt();
-      this.logs         = this.loadLogs();
+      // Restore the console log across page refreshes. Elapsed time doesn't need
+      // its own persistence — it's derived from process.runStartedAt, which the
+      // server owns and sends on every status/init event.
+      this.logs = this.loadLogs();
       setInterval(() => { this.now = Date.now(); }, 250);
 
       try {
@@ -86,22 +103,7 @@ function app() {
       catch {}
     },
 
-    // ── Run start time + logs persistence (survive page refresh) ───────────
-    loadRunStartedAt() {
-      try {
-        const v = localStorage.getItem(this.RUN_START_KEY);
-        return v ? Number(v) : null;
-      } catch { return null; }
-    },
-    saveRunStartedAt(ts) {
-      try { localStorage.setItem(this.RUN_START_KEY, String(ts)); }
-      catch {}
-    },
-    clearRunStartedAt() {
-      try { localStorage.removeItem(this.RUN_START_KEY); }
-      catch {}
-    },
-
+    // ── Log persistence (survive page refresh) ─────────────────────────────
     loadLogs() {
       try { return JSON.parse(localStorage.getItem(this.LOGS_KEY)) || []; }
       catch { return []; }
@@ -165,11 +167,10 @@ function app() {
         case 'init':
         case 'status':
           this.applyState(msg.data);
-          this.trackRunStart();
           break;
         case 'progress':
           Object.assign(this.process, msg.data);
-          this.trackRunStart();
+          this.recordHistorySample();
           break;
         case 'activity':
           this.feed.unshift(msg.data);
@@ -202,19 +203,13 @@ function app() {
     },
 
     // ── Client-side rate/ETA (speed = done / elapsed, remaining = left / speed) ──
-    trackRunStart() {
-      if (this.process.status === 'running' && !this.runStartedAt) {
-        this.runStartedAt = Date.now();
-        this.saveRunStartedAt(this.runStartedAt);
-      } else if (['idle', 'stopped'].includes(this.process.status)) {
-        this.runStartedAt = null;
-        this.clearRunStartedAt();
-      }
-    },
-
+    // runStartedAt is server-owned (set only when the Start endpoint fires) and
+    // arrives via process.runStartedAt on every status/progress event — no local
+    // tracking needed, which also means it can't drift out of sync after a
+    // server restart the way a client-invented timestamp could.
     clientStats() {
-      if (!this.runStartedAt) return { elapsedSeconds: null, perSec: 0, etaSeconds: null };
-      const elapsedSeconds = (Date.now() - this.runStartedAt) / 1000;
+      if (!this.process.runStartedAt) return { elapsedSeconds: null, perSec: 0, etaSeconds: null };
+      const elapsedSeconds = (this.now - this.process.runStartedAt) / 1000;
       const haveGrand = this.process.grandTotal !== null && this.process.grandRemaining !== null;
       const done      = haveGrand ? this.process.grandTotal - this.process.grandRemaining : this.process.done;
       const remaining = haveGrand ? this.process.grandRemaining : Math.max(0, this.process.total - this.process.done);
@@ -235,6 +230,14 @@ function app() {
     async confirmReset() {
       if (!confirm('Reset progress counters? This does NOT undo emails already moved/deleted.')) return;
       await this.apiPost('/api/process/reset');
+      this.history = [];
+    },
+
+    // Wraps the Start button's API call so a fresh run also clears the
+    // previous run's chart history instead of appending onto it.
+    async startProcess() {
+      this.history = [];
+      await this.apiPost('/api/process/start');
     },
 
     // ── Rules ─────────────────────────────────────────────
@@ -322,6 +325,122 @@ function app() {
       return Math.min(100, Math.floor((done / total) * 100));
     },
 
+    // ── Activity-over-time chart ────────────────────────────────────────
+    // Throttled to one sample per 2s (not one per progress event, which fires
+    // per rule/LLM batch and would flood the buffer) and capped at HISTORY_MAX
+    // so a long-running session ages out its oldest points instead of growing forever.
+    recordHistorySample() {
+      const now = Date.now();
+      if (this.history.length && now - this._lastHistoryAt < 2000) return;
+      this._lastHistoryAt = now;
+      this.history.push({
+        t:            now,
+        llmProcessed: this.process.llmProcessed || 0,
+        moved:        this.process.moved        || 0,
+        deleted:      this.process.deleted      || 0,
+        saved:        this.process.saved        || 0,
+      });
+      if (this.history.length > this.HISTORY_MAX) this.history.shift();
+    },
+
+    // Computed once per render and reused across the template via `x-for="chart in [chartRender()]"`
+    // — avoids recomputing scales/paths separately for every bound expression.
+    chartRender() {
+      const W = 360, H = 110, padL = 36, padR = 6, padT = 8, padB = 8;
+      const innerW = W - padL - padR, innerH = H - padT - padB;
+      const pts = this.history;
+      const n   = pts.length;
+      const maxY = Math.max(1, ...pts.flatMap(p => this.CHART_SERIES.map(s => p[s.key])));
+      const x = i => padL + (n <= 1 ? innerW : (i / (n - 1)) * innerW);
+      const y = v => padT + innerH - (v / maxY) * innerH;
+
+      const series = this.CHART_SERIES.map(s => ({
+        ...s,
+        path: pts.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(p[s.key]).toFixed(1)}`).join(' '),
+        lastX: n ? x(n - 1) : padL,
+        lastY: n ? y(pts[n - 1][s.key]) : padT + innerH,
+      }));
+
+      const yTicks = [0, 0.5, 1].map(f => ({
+        y:     padT + innerH - f * innerH,
+        label: this.fmtShort(Math.round(maxY * f)),
+      }));
+
+      return { W, H, padL, padT, innerW, n, x, series, yTicks, pts };
+    },
+
+    chartSpanLabel() {
+      const chart = this.chartData();
+      if (chart.n < 2) return '';
+      const seconds = (chart.pts[chart.n - 1].t - chart.pts[0].t) / 1000;
+      return 'last ' + this.fmtEta(seconds);
+    },
+
+    chartViewBox() {
+      const chart = this.chartData();
+      return '0 0 ' + chart.W + ' ' + chart.H;
+    },
+
+    // Everything inside the <svg> is built as a string here and injected via
+    // x-html — Alpine template x-for can't resolve loop vars inside an SVG
+    // element, so we generate the markup directly (grid, ticks, series lines,
+    // end markers, and the hover crosshair) instead of using <template x-for>.
+    chartMarkup() {
+      const c = this.chartData();
+      const { padL, padT, W, H, n, series, yTicks, x } = c;
+      let m = '';
+      for (const t of yTicks) {
+        m += `<line class="chart-grid" x1="${padL}" x2="${W - 12}" y1="${t.y}" y2="${t.y}"/>`;
+      }
+      for (const t of yTicks) {
+        m += `<text class="chart-ytick" x="${padL - 6}" y="${t.y + 3}">${t.label}</text>`;
+      }
+      for (const s of series) {
+        m += `<path class="chart-line" d="${s.path}" fill="none" stroke="${s.color}" stroke-width="1.5"/>`;
+      }
+      for (const s of series) {
+        m += `<g><circle class="chart-end-ring" cx="${s.lastX}" cy="${s.lastY}" r="6"/><circle cx="${s.lastX}" cy="${s.lastY}" r="4" fill="${s.color}"/></g>`;
+      }
+      if (this.hoverIdx !== null && n) {
+        const hx = x(this.hoverIdx);
+        m += `<line class="chart-crosshair" x1="${hx.toFixed(1)}" x2="${hx.toFixed(1)}" y1="${padT}" y2="${H - 10}"/>`;
+      }
+      return m;
+    },
+
+    // Flat cached accessor for the chart — every template binding calls this
+    // instead of a nested x-for loop variable, because Alpine drops the outer
+    // loop scope inside a nested <template x-for> (only the first item renders).
+    chartData() {
+      const pts   = this.history;
+      const last  = pts.length ? pts[pts.length - 1] : null;
+      const key   = pts.length + ':' + (last ? last.t : 0);
+      if (chartKey !== key || !chartCache) {
+        chartKey  = key;
+        chartCache = this.chartRender();
+      }
+      return chartCache;
+    },
+
+    onChartMove(e) {
+      const chart = this.chartData();
+      if (!chart.n) return;
+      const rect  = e.currentTarget.getBoundingClientRect();
+      const relX  = ((e.clientX - rect.left) / rect.width) * chart.W;
+      const frac  = chart.n <= 1 ? 0 : (relX - chart.padL) / chart.innerW;
+      this.hoverIdx = Math.min(chart.n - 1, Math.max(0, Math.round(frac * (chart.n - 1))));
+    },
+
+    onChartLeave() {
+      this.hoverIdx = null;
+    },
+
+    hoverTime() {
+      const chart = this.chartData();
+      if (this.hoverIdx === null || !chart.pts[this.hoverIdx]) return '';
+      return new Date(chart.pts[this.hoverIdx].t).toTimeString().slice(0, 8);
+    },
+
     // ── Pipeline visualizer (fetch / LLM pool / LLM call, live) ────────────
     poolBar() {
       const cap  = this.pipeline.poolCapacity || 0;
@@ -338,22 +457,42 @@ function app() {
 
     fetchTicker(n = 30) {
       const letter = action => action === 'move' ? 'M' : action === 'delete' ? 'D' : action === 'save' ? 'S' : '?';
-      return this.feed.slice(0, n).map(item => ({ action: item.action, letter: letter(item.action) })).reverse();
+      return this.feed.slice(0, n).map(item => ({
+        action: item.action,
+        letter: letter(item.action),
+        isLLM: !!(item.source && item.source.startsWith('llm')),
+      })).reverse();
     },
 
-    llmElapsedSeconds() {
-      if (this.pipeline.llmState !== 'thinking' || !this.pipeline.llmStartedAt) return null;
-      return Math.max(0, (this.now - this.pipeline.llmStartedAt) / 1000);
-    },
-
-    llmCallText() {
-      const elapsed = this.llmElapsedSeconds();
-      return elapsed !== null ? `thinking… ${elapsed.toFixed(1)}s` : 'waiting…';
+    // One entry per concurrency slot (llmCapacity total) — active slots show
+    // elapsed time for that call, idle slots show a dash.
+    llmSlots() {
+      const cap    = this.pipeline.llmCapacity || 0;
+      const starts = this.pipeline.llmCallStartedAts || [];
+      return Array.from({ length: cap }, (_, i) => {
+        const startedAt = starts[i];
+        return startedAt
+          ? { active: true, elapsed: Math.max(0, (this.now - startedAt) / 1000) }
+          : { active: false, elapsed: null };
+      });
     },
 
     fmt(n) {
       if (n === undefined || n === null) return '0';
       return Number(n).toLocaleString();
+    },
+
+    // Compact tick labels — "1.2k", "3.4M" — so the chart stays legible in a
+    // slim middle column even when a series climbs into the tens of thousands.
+    fmtShort(n) {
+      if (n === undefined || n === null) return '0';
+      if (n < 1000) return String(n);
+      if (n < 100000) {
+        const k = n / 1000;
+        return (Number.isInteger(k) ? String(k) : k.toFixed(1)) + 'k';
+      }
+      const m = n / 1000000;
+      return (Number.isInteger(m) ? String(m) : m.toFixed(1)) + 'M';
     },
 
     fmtRate(perSec) {

@@ -79,6 +79,7 @@ app.post('/api/disconnect', (req, res) => {
 app.post('/api/process/start', (req, res) => {
   if (!state.credentials) return res.status(401).json({ error: 'Not connected' });
   if (state.process.status === 'running') return res.json({ ok: true, msg: 'Already running' });
+  state.process.runStartedAt = Date.now();
   res.json({ ok: true });
   processor.start(state.credentials);
 });
@@ -94,6 +95,9 @@ app.post('/api/process/resume', (req, res) => {
   if (processor.isRunning()) {
     processor.resume();
   } else {
+    // No live connection survived (e.g. a server restart) — this is really a fresh
+    // start() under the hood, so it needs its own runStartedAt just like Start does.
+    state.process.runStartedAt = Date.now();
     processor.start(state.credentials);
   }
 });
@@ -107,9 +111,9 @@ app.post('/api/process/stop', (req, res) => {
 app.post('/api/process/reset', (req, res) => {
   if (state.process.status === 'running') return res.status(400).json({ error: 'Cannot reset while running' });
   try { fs.unlinkSync(PROG_FILE); } catch {}
-  state.process  = { status: 'idle', total: 0, done: 0, moved: 0, deleted: 0, saved: 0 };
+  state.process  = { status: 'idle', total: 0, done: 0, moved: 0, deleted: 0, saved: 0, llmProcessed: 0, runStartedAt: null };
   state.stats    = { folders: {} };
-  state.pipeline = { poolSize: 0, poolCapacity: 0, fetchChunk: 0, fetchTotalChunks: 0, llmState: 'idle', llmStartedAt: null };
+  state.pipeline = { poolSize: 0, poolCapacity: 0, fetchChunk: 0, fetchTotalChunks: 0, llmActive: 0, llmCapacity: 0, llmCallStartedAts: [] };
   broadcast('status', { process: state.process, stats: state.stats });
   broadcast('pipeline', state.pipeline);
   res.json({ ok: true });

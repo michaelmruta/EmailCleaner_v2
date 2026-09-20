@@ -179,6 +179,44 @@ body {
 .eta-hint      { font-size: 10px; margin-top: 6px; }
 .eta-elapsed   { font-size: 10px; margin-top: 3px; }
 
+/* ── Activity Over Time Chart (between process + ETA cards) ────────── */
+.chart-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  width: 360px; flex-shrink: 0;
+  min-width: 0;
+  display: flex; flex-direction: column; justify-content: center; gap: 8px;
+}
+.chart-header   { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.chart-title    { font-size: 12px; font-weight: 700; white-space: nowrap; }
+.chart-span     { font-size: 10px; white-space: nowrap; }
+.chart-legend   { display: flex; flex-wrap: wrap; gap: 3px 12px; }
+.chart-legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; white-space: nowrap; }
+.chart-legend-key  { width: 8px; height: 8px; border-radius: 2px; display: inline-block; flex-shrink: 0; }
+
+.chart-card .feed-empty { padding: 12px; }
+
+.chart-wrap { position: relative; width: 100%; }
+.chart-svg  { width: 100%; height: auto; aspect-ratio: 360 / 110; display: block; }
+.chart-grid     { stroke: rgba(48,54,61,0.6); stroke-width: 1; }
+.chart-ytick    { fill: var(--muted); font-size: 9px; text-anchor: end; }
+.chart-line     { stroke-width: 1.5; }
+.chart-end-ring { fill: var(--card); stroke: rgba(230,237,243,0.35); stroke-width: 1; }
+.chart-crosshair { stroke: rgba(125,133,144,0.5); stroke-dasharray: 3 3; stroke-width: 1; }
+
+.chart-tooltip {
+  position: absolute; top: 2px; transform: translateX(-50%);
+  background: var(--card2); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 9px; font-size: 10px; white-space: nowrap;
+  z-index: 20; box-shadow: 0 4px 12px rgba(0,0,0,0.45);
+  pointer-events: none;
+}
+.chart-tooltip-time { color: var(--muted); margin-bottom: 4px; }
+.chart-tooltip-row  { display: flex; align-items: center; gap: 6px; line-height: 1.5; }
+.chart-tooltip-val  { font-weight: 700; min-width: 34px; text-align: right; flex-shrink: 0; }
+
 /* ── Pipeline Visualizer ─────────────────────────────────────────────── */
 .pipeline-card {
   background: var(--card);
@@ -203,6 +241,12 @@ body {
 }
 .pipeline-note { color: var(--text); flex-shrink: 0; }
 .pipeline-thinking { color: var(--orange); }
+.pipeline-legend { font-size: 10px; padding-top: 2px; border-top: 1px solid var(--border); margin-top: 2px; white-space: normal; }
+.pipeline-legend .tag-move, .pipeline-legend .tag-delete, .pipeline-legend .tag-save { font-weight: 700; }
+.pipeline-legend:first-child {
+  border-top: none; border-bottom: 1px solid var(--border);
+  margin-top: 0; padding-top: 0; padding-bottom: 6px; margin-bottom: 2px;
+}
 .pipeline-ticker {
   color: var(--muted); overflow: hidden; text-overflow: ellipsis;
   letter-spacing: 0.5px; font-weight: 700;
@@ -210,6 +254,7 @@ body {
 .tag-move   { color: var(--green); }
 .tag-delete { color: var(--red); }
 .tag-save   { color: var(--teal); }
+.tag-llm    { color: var(--orange); font-weight: 700; }
 
 /* ── Stats Bar ───────────────────────────────────────────────────────── */
 .stats-bar {
@@ -345,5 +390,5 @@ body {
 
 /* ── Responsive ───────────────────────────────────────────────────────── */
 @media (max-width: 1200px) { .stats-bar { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 900px)  { .panels { grid-template-columns: 1fr; } .rules-grid { grid-template-columns: 1fr; } .process-row { flex-direction: column; } .eta-card { width: 100%; } }
+@media (max-width: 900px)  { .panels { grid-template-columns: 1fr; } .rules-grid { grid-template-columns: 1fr; } .process-row { flex-direction: column; } .eta-card { width: 100%; } .chart-card { width: 100%; } }
 @media (max-width: 700px)  { .stats-bar { grid-template-columns: repeat(2, 1fr); } }

@@ -48,3 +48,9 @@ account password won't work, and 2-step verification must be enabled first.
 Processed **130,000 emails in ~12 hours** using `gpt-oss:20b` via Ollama on an
 M1 Max (64GB) for the LLM fallback path — most emails were resolved by rules
 alone; only unclassified emails hit the LLM.
+
+LLM batch size is 10 (`LLM_POOL_SIZE` in `src/processor.js`). Benchmarking
+`gpt-oss:20b` on batched classification requests found batches of 15/20/25/30
+reliably return one result per email, but 35+ silently drops 1-2 items (the
+model loses track of the list, not a token-budget truncation) — 10 keeps margin
+below that ceiling.

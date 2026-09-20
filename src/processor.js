@@ -12,9 +12,18 @@ const PROG_FILE     = path.join(DATA_DIR, 'progress.json');
 const MBOX_FILE     = path.join(DATA_DIR, 'unclassified.mbox');
 const FOLDERS_FILE  = path.join(DATA_DIR, 'folders-ensured.json');
 const FETCH_CHUNK_SIZE = 40; // emails per IMAP header/envelope fetch round trip
-const LLM_POOL_SIZE    = 40; // emails accumulated before firing an LLM batch call — decoupled from
+const LLM_POOL_SIZE    = 10; // emails accumulated before firing an LLM batch call — decoupled from
                               // FETCH_CHUNK_SIZE so batches stay full-sized regardless of how much the
-                              // rule engine already filtered out; tested up to 80 with 100% accuracy on gpt-oss:20b
+                              // rule engine already filtered out. Benchmarked against gpt-oss:20b: batches
+                              // of 15/20/25/30 return a fully correct result count, but 35+ silently drops
+                              // 1-2 items (done_reason "stop", not a token-budget truncation — the model
+                              // just loses track of the list past ~30). 10 trades per-call efficiency for
+                              // lower latency and finer-grained concurrency below.
+const MAX_CONCURRENT_LLM_CALLS = 5;  // up to this many LLM batch calls in flight at once — fetch only
+                                      // pauses once this many are active AND the filling pool is also full.
+                                      // Note: Ollama serves one model instance and queues requests unless
+                                      // OLLAMA_NUM_PARALLEL > 1 is set — without that, concurrent calls
+                                      // mostly just buffer more work rather than truly running in parallel.
 const BATCH_DELAY = 150; // ms between fetch chunks — avoids Yahoo IMAP rate limiting
 const PARALLEL_WORKERS = Math.max(1, parseInt(process.env.PARALLEL_WORKERS, 10) || 5); // concurrent LLM calls / downloads per batch
 
@@ -172,9 +181,11 @@ async function applyResults(client, items, log) {
   const toMove   = new Map();   // folder → uid[]
   const toDelete = [];          // uid[]
   const toSave   = [];          // { uid, envelope }
+  let llmCount   = 0;
 
   for (const { msg, emailData, result } of items) {
     const from = emailData.from || emailData.fromName;
+    if (result?.source && result.source.startsWith('llm')) llmCount++;
 
     if (result?.action === 'move') {
       if (!toMove.has(result.folder)) toMove.set(result.folder, []);
@@ -194,6 +205,8 @@ async function applyResults(client, items, log) {
       addActivity({ uid: msg.uid, from, subject: emailData.subject, action: 'save', source: result?.source || 'unclassified' });
     }
   }
+
+  if (llmCount) state.process.llmProcessed += llmCount;
 
   // ── Move to folder (messageMove = COPY + store \Deleted + EXPUNGE) ──
   for (const [folder, uids] of toMove) {
@@ -225,21 +238,27 @@ async function applyResults(client, items, log) {
 }
 
 // ── LLM pool: decouples "how many emails need the LLM" from "how many were just
-// fetched". Fetch keeps appending to the pool; once it reaches `size`, a batch
-// call fires and the pool resets immediately so fetch can keep filling a new one
-// while that call is in flight. `add()` only blocks (backpressure) if a second
-// full pool piles up before the previous call (classify + apply results) resolves ──
-function createLLMPool(size, onFull, onSizeChange = () => {}) {
-  let items    = [];
-  let inFlight = null;
+// fetched". Fetch keeps appending to the currently-filling pool; once it reaches
+// `size`, it's handed off and fetch immediately starts filling a fresh pool. Up
+// to `maxConcurrent` handed-off pools can be in flight (classify + apply results)
+// at once — fetch only blocks (backpressure) once the filling pool is ALSO full
+// and every concurrency slot is already occupied ──────────────────────────────
+function createLLMPool(size, maxConcurrent, onFull, onSizeChange = () => {}) {
+  let items = [];
+  const inFlight = new Set();
+
+  function dispatch(batch) {
+    const p = onFull(batch).finally(() => inFlight.delete(p));
+    inFlight.add(p);
+  }
 
   async function flush() {
     if (items.length === 0) return;
-    if (inFlight) await inFlight;
+    if (inFlight.size >= maxConcurrent) await Promise.race(inFlight);
     const batch = items;
     items = [];
     onSizeChange(0);
-    inFlight = onFull(batch).finally(() => { inFlight = null; });
+    dispatch(batch);
   }
 
   async function add(item) {
@@ -250,7 +269,7 @@ function createLLMPool(size, onFull, onSizeChange = () => {}) {
 
   async function drain() {
     await flush();
-    if (inFlight) await inFlight;
+    await Promise.allSettled(inFlight);
   }
 
   return { add, drain };
@@ -293,6 +312,7 @@ async function start(credentials) {
   state.process.moved         = 0;
   state.process.deleted       = 0;
   state.process.saved         = 0;
+  state.process.llmProcessed  = 0;
   state.process.currentAction = 'Connecting to Yahoo IMAP…';
   state.process.grandTotal     = null;
   state.process.grandRemaining = null;
@@ -400,11 +420,12 @@ async function start(credentials) {
         state.process.grandRemaining = grandRemaining;
 
         broadcast('progress', {
-          done:       state.process.done,
-          total:      state.process.total,
-          moved:      state.process.moved,
-          deleted:    state.process.deleted,
-          saved:      state.process.saved,
+          done:         state.process.done,
+          total:        state.process.total,
+          moved:        state.process.moved,
+          deleted:      state.process.deleted,
+          saved:        state.process.saved,
+          llmProcessed: state.process.llmProcessed,
           perSec,
           etaSeconds,
           grandTotal,
@@ -414,12 +435,24 @@ async function start(credentials) {
         broadcast('stats', state.stats);
       }
 
-      // Runs once a pool of LLM_POOL_SIZE ambiguous emails has accumulated —
-      // dispatched by createLLMPool without blocking the fetch loop.
-      async function processLLMPoolBatch(poolItems) {
-        state.pipeline.llmState     = 'thinking';
-        state.pipeline.llmStartedAt = Date.now();
+      // Up to MAX_CONCURRENT_LLM_CALLS pools can be in flight at once — tracked here
+      // so the pipeline visualizer can show how many are active and how long the
+      // oldest one has been running.
+      const activeLLMCalls = new Set(); // { startedAt }
+
+      function updateLLMActive() {
+        state.pipeline.llmActive = activeLLMCalls.size;
+        state.pipeline.llmCallStartedAts = [...activeLLMCalls].map(c => c.startedAt).sort((a, b) => a - b);
         broadcastPipeline();
+      }
+
+      // Runs once a pool of LLM_POOL_SIZE ambiguous emails has accumulated —
+      // dispatched by createLLMPool without blocking the fetch loop. Up to
+      // MAX_CONCURRENT_LLM_CALLS of these can run at the same time.
+      async function processLLMPoolBatch(poolItems) {
+        const call = { startedAt: Date.now() };
+        activeLLMCalls.add(call);
+        updateLLMActive();
         try {
           const batchResults = await classifyBatchWithLLM(poolItems.map(item => item.emailData), log);
           let results;
@@ -437,15 +470,15 @@ async function start(credentials) {
         } catch (err) {
           log('warn', `LLM pool batch failed: ${err.message}`);
         } finally {
-          state.pipeline.llmState     = 'idle';
-          state.pipeline.llmStartedAt = null;
-          broadcastPipeline();
+          activeLLMCalls.delete(call);
+          updateLLMActive();
           recordDone(poolItems.length);
         }
       }
 
       state.pipeline.poolCapacity = LLM_POOL_SIZE;
-      const llmPool = createLLMPool(LLM_POOL_SIZE, processLLMPoolBatch, size => {
+      state.pipeline.llmCapacity  = MAX_CONCURRENT_LLM_CALLS;
+      const llmPool = createLLMPool(LLM_POOL_SIZE, MAX_CONCURRENT_LLM_CALLS, processLLMPoolBatch, size => {
         state.pipeline.poolSize = size;
         broadcastPipeline();
       });
@@ -555,10 +588,10 @@ async function start(credentials) {
   } finally {
     _client = null;
     await client.logout().catch(() => {});
-    state.pipeline.poolSize        = 0;
-    state.pipeline.fetchChunk      = 0;
-    state.pipeline.llmState        = 'idle';
-    state.pipeline.llmStartedAt    = null;
+    state.pipeline.poolSize           = 0;
+    state.pipeline.fetchChunk         = 0;
+    state.pipeline.llmActive          = 0;
+    state.pipeline.llmCallStartedAts  = [];
     broadcastPipeline();
     broadcast('status', { process: state.process });
   }

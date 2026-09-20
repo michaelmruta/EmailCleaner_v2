@@ -106,7 +106,7 @@
         <div class="process-controls">
           <button class="btn btn-primary btn-sm"
             x-show="['idle','stopped'].includes(process.status)"
-            @click="apiPost('/api/process/start')"><i class="fa-solid fa-play"></i> Start</button>
+            @click="startProcess()"><i class="fa-solid fa-play"></i> Start</button>
           <button class="btn btn-primary btn-sm"
             x-show="process.status === 'paused'"
             @click="apiPost('/api/process/resume')"><i class="fa-solid fa-play"></i> Resume (<span x-text="fmt(process.done)"></span> done)</button>
@@ -121,6 +121,48 @@
           <button class="btn btn-ghost btn-sm"
             x-show="!['running','paused'].includes(process.status)"
             @click="confirmReset()"><i class="fa-solid fa-rotate-left"></i> Reset</button>
+        </div>
+      </div>
+
+      <!-- ── Activity Over Time — LLM processed / moved / deleted / mbox ─────── -->
+      <div class="chart-card">
+        <div class="chart-header">
+          <span class="chart-title">Activity Over Time</span>
+          <span class="chart-span muted" x-show="chartData().n >= 2" x-text="chartSpanLabel()"></span>
+        </div>
+
+        <div class="chart-legend">
+          <template x-for="s in CHART_SERIES" :key="s.key">
+            <span class="chart-legend-item">
+              <span class="chart-legend-key" :style="'background:' + s.color"></span>
+              <span class="muted" x-text="s.label"></span>
+            </span>
+          </template>
+        </div>
+
+        <div class="feed-empty" x-show="history.length < 2">Waiting for activity…</div>
+
+        <div class="chart-wrap" x-show="history.length >= 2"
+             @mousemove="onChartMove($event)" @mouseleave="onChartLeave()">
+          <!-- Full SVG (grid, ticks, series, end markers, crosshair) is built in
+               JS via chartMarkup() and injected with x-html — Alpine's template
+               x-for can't scope loop vars inside an SVG element, so lines/tags
+               are generated as a string instead. -->
+          <svg :viewBox="chartViewBox()" preserveAspectRatio="none" class="chart-svg"
+               x-html="chartMarkup()"></svg>
+
+          <!-- Hover tooltip -->
+          <div class="chart-tooltip" x-show="hoverIdx !== null"
+               :style="{ left: (hoverIdx !== null && chartData().n > 1 ? (chartData().x(hoverIdx) / chartData().W) * 100 : 0) + '%' }">
+            <div class="chart-tooltip-time" x-text="hoverTime()"></div>
+            <template x-for="s in chartData().series" :key="s.key">
+              <div class="chart-tooltip-row">
+                <span class="chart-legend-key" :style="'background:' + s.color"></span>
+                <span class="chart-tooltip-val" x-text="fmt(chartData().pts[hoverIdx] ? chartData().pts[hoverIdx][s.key] : 0)"></span>
+                <span class="muted" x-text="s.label"></span>
+              </div>
+            </template>
+          </div>
         </div>
       </div>
 
@@ -172,23 +214,34 @@
       </div>
     </div>
 
-    <!-- ── Pipeline Visualizer — live fetch / LLM pool / LLM call state ──── -->
+    <!-- ── Pipeline Visualizer — live fetch / LLM pools / LLM calls state ── -->
     <div class="pipeline-card" x-show="['running','paused'].includes(process.status)">
+      <div class="pipeline-row pipeline-legend muted">
+        <span class="pipeline-label"></span>
+        <span>Pool 0 = collecting batch (fills to <span x-text="pipeline.poolCapacity"></span> before sending) · Pools 1–<span x-text="pipeline.llmCapacity"></span> = LLM calls in flight (max <span x-text="pipeline.llmCapacity"></span> at once)</span>
+      </div>
       <div class="pipeline-row">
-        <span class="pipeline-label">LLM POOL</span>
+        <span class="pipeline-label">POOL 0</span>
         <span class="pipeline-bar" x-text="poolBar()"></span>
         <span class="pipeline-note muted" x-text="poolStatusText()"></span>
       </div>
+      <template x-for="(slot, idx) in llmSlots()" :key="idx">
+        <div class="pipeline-row">
+          <span class="pipeline-label" x-text="'POOL ' + (idx + 1)"></span>
+          <span class="pipeline-note" :class="{ 'pipeline-thinking': slot.active }"
+                x-text="slot.active ? 'thinking… ' + slot.elapsed.toFixed(1) + 's' : 'idle'"></span>
+        </div>
+      </template>
       <div class="pipeline-row">
         <span class="pipeline-label">FETCH</span>
         <span class="pipeline-note muted" x-text="pipeline.fetchTotalChunks ? pipeline.fetchChunk + '/' + pipeline.fetchTotalChunks : '—'"></span>
         <span class="pipeline-ticker">
-          <template x-for="(tag, idx) in fetchTicker()" :key="idx">[<span :class="'tag-' + tag.action" x-text="tag.letter"></span>]</template>
+          <template x-for="(tag, idx) in fetchTicker()" :key="idx">[<span :class="'tag-' + tag.action" x-text="tag.letter"></span><span x-show="tag.isLLM" class="tag-llm">*</span>]</template>
         </span>
       </div>
-      <div class="pipeline-row">
-        <span class="pipeline-label">LLM CALL</span>
-        <span class="pipeline-note" :class="{ 'pipeline-thinking': pipeline.llmState === 'thinking' }" x-text="llmCallText()"></span>
+      <div class="pipeline-row pipeline-legend muted">
+        <span class="pipeline-label"></span>
+        <span><span class="tag-move">M</span> move · <span class="tag-delete">D</span> delete · <span class="tag-save">S</span> save · <span class="tag-llm">*</span> decided by LLM (no * = rule-classified)</span>
       </div>
     </div>
 
