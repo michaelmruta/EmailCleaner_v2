@@ -10,13 +10,20 @@ function app() {
 
     form: { email: '', password: '' },
 
-    SESSION_KEY: 'ec_session',
+    SESSION_KEY:   'ec_session',
+    RUN_START_KEY: 'ec_run_started_at',
+    LOGS_KEY:      'ec_logs',
 
     process: {
       status: 'idle', total: 0, done: 0, moved: 0, deleted: 0, saved: 0, currentAction: '',
       perSec: 0, etaSeconds: null, grandTotal: null, grandRemaining: null, grandEtaSeconds: null,
     },
     stats:   { folders: {} },
+
+    pipeline: {
+      poolSize: 0, poolCapacity: 0, fetchChunk: 0, fetchTotalChunks: 0,
+      llmState: 'idle', llmStartedAt: null,
+    },
 
     feed: [],
     logs: [],
@@ -25,6 +32,7 @@ function app() {
 
     _es: null,
     runStartedAt: null, // wall-clock ms when the current run started (persists through pause/resume)
+    now: Date.now(), // ticks every 250ms — reactive clock source for live elapsed timers
 
     // ── AI settings modal ───────────────────────────────────
     showSettings:  false,
@@ -37,6 +45,12 @@ function app() {
 
     // ── Init ──────────────────────────────────────────────
     async init() {
+      // Restore across page refreshes — the actual run start time (so elapsed
+      // time keeps counting from when the run really began) and the console log.
+      this.runStartedAt = this.loadRunStartedAt();
+      this.logs         = this.loadLogs();
+      setInterval(() => { this.now = Date.now(); }, 250);
+
       try {
         const res  = await fetch('/api/status');
         const data = await res.json();
@@ -69,6 +83,31 @@ function app() {
     },
     clearSession() {
       try { localStorage.removeItem(this.SESSION_KEY); }
+      catch {}
+    },
+
+    // ── Run start time + logs persistence (survive page refresh) ───────────
+    loadRunStartedAt() {
+      try {
+        const v = localStorage.getItem(this.RUN_START_KEY);
+        return v ? Number(v) : null;
+      } catch { return null; }
+    },
+    saveRunStartedAt(ts) {
+      try { localStorage.setItem(this.RUN_START_KEY, String(ts)); }
+      catch {}
+    },
+    clearRunStartedAt() {
+      try { localStorage.removeItem(this.RUN_START_KEY); }
+      catch {}
+    },
+
+    loadLogs() {
+      try { return JSON.parse(localStorage.getItem(this.LOGS_KEY)) || []; }
+      catch { return []; }
+    },
+    saveLogs() {
+      try { localStorage.setItem(this.LOGS_KEY, JSON.stringify(this.logs)); }
       catch {}
     },
 
@@ -143,6 +182,9 @@ function app() {
         case 'stats':
           this.stats = msg.data;
           break;
+        case 'pipeline':
+          Object.assign(this.pipeline, msg.data);
+          break;
         case 'log':
           this.addLog(msg.data.level, msg.data.msg);
           break;
@@ -155,6 +197,7 @@ function app() {
       if (data.credentials?.email)       this.userEmail  = data.credentials.email;
       if (data.process)  Object.assign(this.process, data.process);
       if (data.stats)    this.stats = data.stats;
+      if (data.pipeline) Object.assign(this.pipeline, data.pipeline);
       if (data.feed)     this.feed  = data.feed;
     },
 
@@ -162,8 +205,10 @@ function app() {
     trackRunStart() {
       if (this.process.status === 'running' && !this.runStartedAt) {
         this.runStartedAt = Date.now();
+        this.saveRunStartedAt(this.runStartedAt);
       } else if (['idle', 'stopped'].includes(this.process.status)) {
         this.runStartedAt = null;
+        this.clearRunStartedAt();
       }
     },
 
@@ -265,6 +310,7 @@ function app() {
       const time = new Date().toTimeString().slice(0, 8);
       this.logs.unshift({ level, msg, time });
       if (this.logs.length > 300) this.logs.pop();
+      this.saveLogs();
       this.$nextTick(() => {
         const el = document.getElementById('log-list');
         if (el && el.scrollTop < 40) el.scrollTop = 0;
@@ -274,6 +320,35 @@ function app() {
     pct(done, total) {
       if (!total) return 0;
       return Math.min(100, Math.floor((done / total) * 100));
+    },
+
+    // ── Pipeline visualizer (fetch / LLM pool / LLM call, live) ────────────
+    poolBar() {
+      const cap  = this.pipeline.poolCapacity || 0;
+      const size = Math.min(this.pipeline.poolSize, cap);
+      return 'X'.repeat(size) + '-'.repeat(Math.max(0, cap - size));
+    },
+
+    poolStatusText() {
+      const { poolSize, poolCapacity } = this.pipeline;
+      if (!poolCapacity || poolSize === 0) return 'pool not yet ready';
+      if (poolSize >= poolCapacity) return 'pool full — dispatching…';
+      return `collecting… (${poolSize}/${poolCapacity})`;
+    },
+
+    fetchTicker(n = 30) {
+      const letter = action => action === 'move' ? 'M' : action === 'delete' ? 'D' : action === 'save' ? 'S' : '?';
+      return this.feed.slice(0, n).map(item => ({ action: item.action, letter: letter(item.action) })).reverse();
+    },
+
+    llmElapsedSeconds() {
+      if (this.pipeline.llmState !== 'thinking' || !this.pipeline.llmStartedAt) return null;
+      return Math.max(0, (this.now - this.pipeline.llmStartedAt) / 1000);
+    },
+
+    llmCallText() {
+      const elapsed = this.llmElapsedSeconds();
+      return elapsed !== null ? `thinking… ${elapsed.toFixed(1)}s` : 'waiting…';
     },
 
     fmt(n) {

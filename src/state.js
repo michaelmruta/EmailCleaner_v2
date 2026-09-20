@@ -24,6 +24,16 @@ const state = {
     folders: {},            // folder → count (this session)
   },
 
+  // Live view into the fetch/rules/LLM pipeline — for the pipeline visualizer panel.
+  pipeline: {
+    poolSize:        0,        // ambiguous emails currently queued for the LLM
+    poolCapacity:    0,        // LLM_POOL_SIZE — pool fires a batch call once poolSize reaches this
+    fetchChunk:      0,        // current IMAP fetch chunk number
+    fetchTotalChunks: 0,       // total fetch chunks this pass
+    llmState:        'idle',   // idle | thinking
+    llmStartedAt:    null,     // ms timestamp the in-flight batch call started, or null
+  },
+
   feed: [],                 // last 150 activity items
   error: null,
 };

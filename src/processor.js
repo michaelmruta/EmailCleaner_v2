@@ -11,8 +11,11 @@ const DATA_DIR      = path.join(__dirname, '..', 'data');
 const PROG_FILE     = path.join(DATA_DIR, 'progress.json');
 const MBOX_FILE     = path.join(DATA_DIR, 'unclassified.mbox');
 const FOLDERS_FILE  = path.join(DATA_DIR, 'folders-ensured.json');
-const BATCH_SIZE  = 40; // emails per IMAP fetch + per LLM batch call — tested up to 80 with 100% accuracy on gpt-oss:20b, 40 balances throughput vs blast radius
-const BATCH_DELAY = 150; // ms between batches — avoids Yahoo IMAP rate limiting
+const FETCH_CHUNK_SIZE = 40; // emails per IMAP header/envelope fetch round trip
+const LLM_POOL_SIZE    = 40; // emails accumulated before firing an LLM batch call — decoupled from
+                              // FETCH_CHUNK_SIZE so batches stay full-sized regardless of how much the
+                              // rule engine already filtered out; tested up to 80 with 100% accuracy on gpt-oss:20b
+const BATCH_DELAY = 150; // ms between fetch chunks — avoids Yahoo IMAP rate limiting
 const PARALLEL_WORKERS = Math.max(1, parseInt(process.env.PARALLEL_WORKERS, 10) || 5); // concurrent LLM calls / downloads per batch
 
 let _aborted = false;
@@ -76,7 +79,7 @@ function loadProgress() {
 
 function saveProgress(p) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(PROG_FILE, JSON.stringify(p));
+  fs.writeFileSync(PROG_FILE, JSON.stringify({ ...p, status: state.process.status }));
 }
 
 // ── Fetch a batch's headers/envelope (kicked off early, awaited later — lets it
@@ -121,12 +124,31 @@ function mboxTimestamp() {
   return `${DAYS[d.getDay()]} ${MONTHS[d.getMonth()]} ${String(d.getDate()).padStart(2,' ')} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())} ${d.getFullYear()}`;
 }
 
-async function appendToMbox(rawBuf, envelope) {
+async function appendToMbox(rawBuf, envelope, file = MBOX_FILE) {
   const from = envelope?.from?.[0]?.address || 'unknown@unknown';
   const fromLine = `From ${from} ${mboxTimestamp()}\n`;
   const body = rawBuf.toString('binary').replace(/^From /gm, '>From ');
   const entry = fromLine + body + (body.endsWith('\n') ? '\n' : '\n\n');
-  fs.appendFileSync(MBOX_FILE, entry, 'binary');
+  fs.appendFileSync(file, entry, 'binary');
+}
+
+// Downloads a batch of messages and appends each to a local mbox file before
+// they're removed from INBOX — shared by the delete and save paths so both
+// keep a local copy regardless of what Yahoo does with expunged mail server-side.
+async function downloadAndAppend(client, items, file, log) {
+  const okUids = [];
+  await mapLimit(items, PARALLEL_WORKERS, async item => {
+    try {
+      const dl = await client.download(item.uid, undefined, { uid: true });
+      const chunks = [];
+      for await (const chunk of dl.content) chunks.push(chunk);
+      await appendToMbox(Buffer.concat(chunks), item.envelope, file);
+      okUids.push(item.uid);
+    } catch (err) {
+      log('warn', `Download uid ${item.uid}: ${err.message}`);
+    }
+  });
+  return okUids;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -137,6 +159,101 @@ function setAction(text) {
 
 function log(level, msg) {
   broadcast('log', { level, msg });
+}
+
+function broadcastPipeline() {
+  broadcast('pipeline', state.pipeline);
+}
+
+// ── Apply classification results: bucket into move/delete/save and execute the
+// IMAP ops. Used both for rule-decided emails (applied immediately) and for a
+// resolved LLM pool batch (applied once its classification comes back) ──────
+async function applyResults(client, items, log) {
+  const toMove   = new Map();   // folder → uid[]
+  const toDelete = [];          // uid[]
+  const toSave   = [];          // { uid, envelope }
+
+  for (const { msg, emailData, result } of items) {
+    const from = emailData.from || emailData.fromName;
+
+    if (result?.action === 'move') {
+      if (!toMove.has(result.folder)) toMove.set(result.folder, []);
+      toMove.get(result.folder).push(msg.uid);
+      state.process.moved++;
+      state.stats.folders[result.folder] = (state.stats.folders[result.folder] || 0) + 1;
+      addActivity({ uid: msg.uid, from, subject: emailData.subject, action: 'move', folder: result.folder, source: result.source });
+
+    } else if (result?.action === 'delete') {
+      toDelete.push(msg.uid);
+      state.process.deleted++;
+      addActivity({ uid: msg.uid, from, subject: emailData.subject, action: 'delete', reason: result.reason, source: result.source });
+
+    } else {
+      toSave.push({ uid: msg.uid, envelope: msg.envelope });
+      state.process.saved++;
+      addActivity({ uid: msg.uid, from, subject: emailData.subject, action: 'save', source: result?.source || 'unclassified' });
+    }
+  }
+
+  // ── Move to folder (messageMove = COPY + store \Deleted + EXPUNGE) ──
+  for (const [folder, uids] of toMove) {
+    try {
+      await client.messageMove(uids.join(','), folder, { uid: true });
+    } catch (err) {
+      log('warn', `Move →${folder} failed: ${err.message}`);
+    }
+  }
+
+  // ── Delete (rule/LLM-classified spam) ──────────────────────────
+  if (toDelete.length) {
+    try {
+      await client.messageDelete(toDelete.join(','), { uid: true });
+    } catch (err) {
+      log('warn', `Delete failed: ${err.message}`);
+    }
+  }
+
+  // ── Download unclassified → unclassified.mbox → delete from INBOX ──
+  const savedUids = await downloadAndAppend(client, toSave, MBOX_FILE, log);
+  if (savedUids.length) {
+    try {
+      await client.messageDelete(savedUids.join(','), { uid: true });
+    } catch (err) {
+      log('warn', `Delete after save: ${err.message}`);
+    }
+  }
+}
+
+// ── LLM pool: decouples "how many emails need the LLM" from "how many were just
+// fetched". Fetch keeps appending to the pool; once it reaches `size`, a batch
+// call fires and the pool resets immediately so fetch can keep filling a new one
+// while that call is in flight. `add()` only blocks (backpressure) if a second
+// full pool piles up before the previous call (classify + apply results) resolves ──
+function createLLMPool(size, onFull, onSizeChange = () => {}) {
+  let items    = [];
+  let inFlight = null;
+
+  async function flush() {
+    if (items.length === 0) return;
+    if (inFlight) await inFlight;
+    const batch = items;
+    items = [];
+    onSizeChange(0);
+    inFlight = onFull(batch).finally(() => { inFlight = null; });
+  }
+
+  async function add(item) {
+    items.push(item);
+    onSizeChange(items.length);
+    if (items.length >= size) await flush();
+  }
+
+  async function drain() {
+    await flush();
+    if (inFlight) await inFlight;
+  }
+
+  return { add, drain };
 }
 
 // ── Ensure target folders exist, one by one with status feedback ──────────────
@@ -258,59 +375,120 @@ async function start(credentials) {
 
       broadcast('progress', { done: state.process.done, total: state.process.total });
 
-      // ── 3. Process in batches (one batch's fetch pipelined against the previous
-      //      batch's LLM call — separate connections, so they run concurrently) ──
-      const batches = [];
-      for (let i = 0; i < allUids.length; i += BATCH_SIZE) batches.push(allUids.slice(i, i + BATCH_SIZE));
-      const totalBatches = batches.length;
+      // ── 3. Fetch runs continuously; rule-decided emails are applied immediately,
+      //      ambiguous ones join a pool that fires a full LLM batch call as soon as
+      //      it reaches LLM_POOL_SIZE. Fetch keeps collecting into a new pool right
+      //      away — it only pauses if a second full pool backs up before the
+      //      previous call (classify + apply results) has resolved. ──────────────
+      const fetchChunks = [];
+      for (let i = 0; i < allUids.length; i += FETCH_CHUNK_SIZE) fetchChunks.push(allUids.slice(i, i + FETCH_CHUNK_SIZE));
+      const totalChunks = fetchChunks.length;
       let sessionDone = 0;
 
-      try {
-        let fetchPromise = batches.length ? fetchBatchMsgs(client, batches[0]) : null;
+      function recordDone(count) {
+        sessionDone   += count;
+        progress.done += count;
+        state.process.done = Math.min(progress.total, progress.done);
+        saveProgress(progress);
+        recordRateSample();
+        const { perSec, etaSeconds } = computeRate();
 
-        for (let b = 0; b < batches.length; b++) {
+        const grandDone      = totalSessionDone + sessionDone;
+        const grandRemaining = grandTotal !== null ? Math.max(0, grandTotal - grandDone) : null;
+        const grandEtaSeconds = grandRemaining !== null && perSec > 0 ? Math.round(grandRemaining / perSec) : null;
+        state.process.grandTotal     = grandTotal;
+        state.process.grandRemaining = grandRemaining;
+
+        broadcast('progress', {
+          done:       state.process.done,
+          total:      state.process.total,
+          moved:      state.process.moved,
+          deleted:    state.process.deleted,
+          saved:      state.process.saved,
+          perSec,
+          etaSeconds,
+          grandTotal,
+          grandRemaining,
+          grandEtaSeconds,
+        });
+        broadcast('stats', state.stats);
+      }
+
+      // Runs once a pool of LLM_POOL_SIZE ambiguous emails has accumulated —
+      // dispatched by createLLMPool without blocking the fetch loop.
+      async function processLLMPoolBatch(poolItems) {
+        state.pipeline.llmState     = 'thinking';
+        state.pipeline.llmStartedAt = Date.now();
+        broadcastPipeline();
+        try {
+          const batchResults = await classifyBatchWithLLM(poolItems.map(item => item.emailData), log);
+          let results;
+          if (batchResults) {
+            results = batchResults;
+          } else {
+            // Batched response didn't parse cleanly — fall back to concurrent per-email calls.
+            results = new Array(poolItems.length);
+            await mapLimit(poolItems, PARALLEL_WORKERS, async (item, idx) => {
+              results[idx] = await classifyWithLLM(item.emailData, log);
+            });
+          }
+          const resolved = poolItems.map((item, idx) => ({ ...item, result: results[idx] }));
+          await applyResults(client, resolved, log);
+        } catch (err) {
+          log('warn', `LLM pool batch failed: ${err.message}`);
+        } finally {
+          state.pipeline.llmState     = 'idle';
+          state.pipeline.llmStartedAt = null;
+          broadcastPipeline();
+          recordDone(poolItems.length);
+        }
+      }
+
+      state.pipeline.poolCapacity = LLM_POOL_SIZE;
+      const llmPool = createLLMPool(LLM_POOL_SIZE, processLLMPoolBatch, size => {
+        state.pipeline.poolSize = size;
+        broadcastPipeline();
+      });
+
+      try {
+        let fetchPromise = fetchChunks.length ? fetchBatchMsgs(client, fetchChunks[0]) : null;
+
+        for (let c = 0; c < fetchChunks.length; c++) {
           if (_aborted) break;
           await checkPaused();
 
-          const batchNum = b + 1;
-          const batch    = batches[b];
+          const chunkNum = c + 1;
+          const chunk    = fetchChunks[c];
+
+          state.pipeline.fetchChunk       = chunkNum;
+          state.pipeline.fetchTotalChunks = totalChunks;
+          broadcastPipeline();
 
           setAction(passCount > 1
-            ? `Pass ${passCount} — ${batchNum}/${totalBatches} — ${state.process.done.toLocaleString()} done`
-            : `Processing ${batchNum}/${totalBatches} — ${state.process.done.toLocaleString()} done`);
+            ? `Pass ${passCount} — fetch ${chunkNum}/${totalChunks} — ${state.process.done.toLocaleString()} done`
+            : `Fetching ${chunkNum}/${totalChunks} — ${state.process.done.toLocaleString()} done`);
 
           // ── Fetch headers + envelope (already in flight from last iteration) ──
           const { msgs, error: fetchErr } = await fetchPromise;
 
-          // Kick off the next batch's fetch now, before classifying this one —
-          // it overlaps with the LLM call below instead of waiting behind it.
-          fetchPromise = (b + 1 < batches.length) ? fetchBatchMsgs(client, batches[b + 1]) : null;
+          // Kick off the next chunk's fetch now, before rule-classifying this one —
+          // it overlaps with rule application / LLM pooling below instead of waiting behind it.
+          fetchPromise = (c + 1 < fetchChunks.length) ? fetchBatchMsgs(client, fetchChunks[c + 1]) : null;
 
           if (fetchErr) {
-            log('warn', `Batch ${batchNum} fetch error: ${fetchErr.message}`);
-            sessionDone   += batch.length;
-            progress.done += batch.length;
-            state.process.done = Math.min(progress.total, progress.done);
-            saveProgress(progress);
-            broadcast('progress', { done: state.process.done, total: state.process.total });
+            log('warn', `Fetch chunk ${chunkNum} error: ${fetchErr.message}`);
+            recordDone(chunk.length);
+            await new Promise(r => setTimeout(r, BATCH_DELAY));
             continue;
           }
 
           if (msgs.length === 0) {
-            sessionDone   += batch.length;
-            progress.done += batch.length;
-            state.process.done = Math.min(progress.total, progress.done);
-            saveProgress(progress);
-            broadcast('progress', { done: state.process.done, total: state.process.total });
+            recordDone(chunk.length);
+            await new Promise(r => setTimeout(r, BATCH_DELAY));
             continue;
           }
 
-          // ── Classify ───────────────────────────────────────────────────
-          const toMove   = new Map();   // folder → uid[]
-          const toDelete = [];
-          const toSave   = [];          // { uid, envelope }
-
-          // Rule classification is synchronous — run it for the whole batch up front.
+          // Rule classification is synchronous — run it for the whole chunk up front.
           const prepared = msgs.map(msg => {
             const h = parseHeaders(msg.headers);
             const emailData = {
@@ -328,114 +506,26 @@ async function start(credentials) {
             return { msg, emailData, result: classifyByRules(emailData) };
           });
 
-          // Anything the rules couldn't decide falls to the LLM — try one batched call first
-          // (cheaper + faster, especially for a single local model), falling back to
-          // concurrent per-email calls if the batch response doesn't parse cleanly.
+          const ruled    = prepared.filter(item => item.result);
           const needsLLM = prepared.filter(item => !item.result);
-          if (needsLLM.length) {
-            const batchResults = await classifyBatchWithLLM(needsLLM.map(item => item.emailData), log);
-            if (batchResults) {
-              needsLLM.forEach((item, i) => { item.result = batchResults[i]; });
-            } else {
-              await mapLimit(needsLLM, PARALLEL_WORKERS, async item => {
-                item.result = await classifyWithLLM(item.emailData, log);
-              });
-            }
+
+          // Rule-decided emails don't depend on the LLM — apply and count them now.
+          if (ruled.length) {
+            await applyResults(client, ruled, log);
+            recordDone(ruled.length);
           }
 
-          // Bucket results in original order (cheap, keeps activity feed/state mutation deterministic).
-          for (const { msg, emailData, result } of prepared) {
-            const from = emailData.from || emailData.fromName;
+          // Ambiguous ones join the shared pool. add() only blocks here if the pool
+          // is already full AND the previous LLM batch call is still in flight.
+          for (const item of needsLLM) await llmPool.add(item);
 
-            if (result?.action === 'move') {
-              if (!toMove.has(result.folder)) toMove.set(result.folder, []);
-              toMove.get(result.folder).push(msg.uid);
-              state.process.moved++;
-              state.stats.folders[result.folder] = (state.stats.folders[result.folder] || 0) + 1;
-              addActivity({ uid: msg.uid, from, subject: emailData.subject, action: 'move', folder: result.folder, source: result.source });
-
-            } else if (result?.action === 'delete') {
-              toDelete.push(msg.uid);
-              state.process.deleted++;
-              addActivity({ uid: msg.uid, from, subject: emailData.subject, action: 'delete', reason: result.reason, source: result.source });
-
-            } else {
-              toSave.push({ uid: msg.uid, envelope: msg.envelope });
-              state.process.saved++;
-              addActivity({ uid: msg.uid, from, subject: emailData.subject, action: 'save', source: result?.source || 'unclassified' });
-            }
-          }
-
-          // ── Move to folder (messageMove = COPY + store \Deleted + EXPUNGE) ──
-          for (const [folder, uids] of toMove) {
-            try {
-              await client.messageMove(uids.join(','), folder, { uid: true });
-            } catch (err) {
-              log('warn', `Move →${folder} failed: ${err.message}`);
-            }
-          }
-
-          // ── Delete (rule-based deletes) ────────────────────────────────
-          if (toDelete.length) {
-            try {
-              await client.messageDelete(toDelete.join(','), { uid: true });
-            } catch (err) {
-              log('warn', `Delete failed: ${err.message}`);
-            }
-          }
-
-          // ── Download unclassified → mbox → delete from INBOX ──────────
-          const savedUids = [];
-          await mapLimit(toSave, PARALLEL_WORKERS, async item => {
-            try {
-              const dl = await client.download(item.uid, undefined, { uid: true });
-              const chunks = [];
-              for await (const chunk of dl.content) chunks.push(chunk);
-              await appendToMbox(Buffer.concat(chunks), item.envelope);
-              savedUids.push(item.uid);
-            } catch (err) {
-              log('warn', `Download uid ${item.uid}: ${err.message}`);
-            }
-          });
-          if (savedUids.length) {
-            try {
-              await client.messageDelete(savedUids.join(','), { uid: true });
-            } catch (err) {
-              log('warn', `Delete after save: ${err.message}`);
-            }
-          }
-
-          // ── Update progress ────────────────────────────────────────────
-          sessionDone   += msgs.length;
-          progress.done += msgs.length;
-          state.process.done = Math.min(progress.total, progress.done);
-          saveProgress(progress);
-          recordRateSample();
-          const { perSec, etaSeconds } = computeRate();
-
-          const grandDone      = totalSessionDone + sessionDone;
-          const grandRemaining = grandTotal !== null ? Math.max(0, grandTotal - grandDone) : null;
-          const grandEtaSeconds = grandRemaining !== null && perSec > 0 ? Math.round(grandRemaining / perSec) : null;
-          state.process.grandTotal     = grandTotal;
-          state.process.grandRemaining = grandRemaining;
-
-          broadcast('progress', {
-            done:       state.process.done,
-            total:      state.process.total,
-            moved:      state.process.moved,
-            deleted:    state.process.deleted,
-            saved:      state.process.saved,
-            perSec,
-            etaSeconds,
-            grandTotal,
-            grandRemaining,
-            grandEtaSeconds,
-          });
-          broadcast('stats', state.stats);
-
-          // Brief pause between batches to avoid Yahoo IMAP rate limiting
+          // Brief pause between fetch chunks to avoid Yahoo IMAP rate limiting
           await new Promise(r => setTimeout(r, BATCH_DELAY));
         }
+
+        // End of pass — flush any partial pool and wait for the last call to land
+        // before releasing the mailbox lock.
+        await llmPool.drain();
       } finally {
         lock.release();
       }
@@ -451,6 +541,7 @@ async function start(credentials) {
     if (!_aborted) {
       state.process.status = 'done';
       state.process.currentAction = '';
+      saveProgress(progress);
       const passNote = passCount > 1 ? ` across ${passCount} passes` : '';
       log('info', `Complete — ${totalSessionDone.toLocaleString()} emails processed this session${passNote}.`);
     }
@@ -459,10 +550,16 @@ async function start(credentials) {
     state.process.status = 'error';
     state.process.currentAction = '';
     state.error = err.message;
+    saveProgress(progress);
     log('error', `Error: ${err.message}`);
   } finally {
     _client = null;
     await client.logout().catch(() => {});
+    state.pipeline.poolSize        = 0;
+    state.pipeline.fetchChunk      = 0;
+    state.pipeline.llmState        = 'idle';
+    state.pipeline.llmStartedAt    = null;
+    broadcastPipeline();
     broadcast('status', { process: state.process });
   }
 }
@@ -471,12 +568,14 @@ async function start(credentials) {
 function pause() {
   setPaused(true);
   state.process.status = 'paused';
+  saveProgress(loadProgress());
   broadcast('status', { process: state.process });
 }
 
 function resume() {
   setPaused(false);
   state.process.status = 'running';
+  saveProgress(loadProgress());
   broadcast('status', { process: state.process });
 }
 
@@ -485,6 +584,7 @@ function stop() {
   setPaused(false);
   state.process.status = 'stopped';
   state.process.currentAction = '';
+  saveProgress(loadProgress());
   broadcast('status', { process: state.process });
 }
 

@@ -107,9 +107,11 @@ app.post('/api/process/stop', (req, res) => {
 app.post('/api/process/reset', (req, res) => {
   if (state.process.status === 'running') return res.status(400).json({ error: 'Cannot reset while running' });
   try { fs.unlinkSync(PROG_FILE); } catch {}
-  state.process = { status: 'idle', total: 0, done: 0, moved: 0, deleted: 0, saved: 0 };
-  state.stats   = { folders: {} };
+  state.process  = { status: 'idle', total: 0, done: 0, moved: 0, deleted: 0, saved: 0 };
+  state.stats    = { folders: {} };
+  state.pipeline = { poolSize: 0, poolCapacity: 0, fetchChunk: 0, fetchTotalChunks: 0, llmState: 'idle', llmStartedAt: null };
   broadcast('status', { process: state.process, stats: state.stats });
+  broadcast('pipeline', state.pipeline);
   res.json({ ok: true });
 });
 
@@ -164,11 +166,17 @@ app.listen(PORT, async () => {
   console.log(`\n  EmailCleaner v2 → http://localhost:${PORT}`);
   console.log(`  AI classifier: ${aiCfg.provider} (${aiCfg.model})\n`);
 
-  // Restore progress from disk
+  // Restore progress from disk — status too, so a finished/interrupted run reads
+  // back as 'done'/'paused' instead of showing a stale total/done next to 'idle'.
   try {
     const p = JSON.parse(fs.readFileSync(PROG_FILE, 'utf8'));
     state.process.total = p.total || 0;
     state.process.done  = p.done  || 0;
+    if (p.status === 'running' || p.status === 'paused') {
+      state.process.status = 'paused'; // no live IMAP connection survives a restart, but it's resumable
+    } else if (p.status === 'done' || p.status === 'stopped') {
+      state.process.status = p.status;
+    }
   } catch {}
 
   // Auto-connect from .env

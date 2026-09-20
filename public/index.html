@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>EmailCleaner v2</title>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body x-data="app()" x-init="init()">
@@ -12,7 +13,7 @@
   <!-- ── Login Modal ───────────────────────────────────────────────────── -->
   <div class="modal-overlay" x-show="!connected" x-cloak>
     <div class="modal">
-      <div class="modal-logo">✉</div>
+      <div class="modal-logo"><i class="fa-solid fa-envelope"></i></div>
       <h2>EmailCleaner <span class="v2">v2</span></h2>
       <p class="modal-sub">Reorganize your Yahoo inbox in realtime</p>
       <div x-show="restoringSession" class="modal-sub">Restoring session…</div>
@@ -41,12 +42,12 @@
     <!-- Header -->
     <header class="header">
       <div class="header-left">
-        <span class="logo">✉ EmailCleaner <span class="v2">v2</span></span>
+        <span class="logo"><i class="fa-solid fa-envelope"></i> EmailCleaner <span class="v2">v2</span></span>
       </div>
       <div class="header-right">
         <span class="dot dot-green"></span>
         <span class="connected-label" x-text="userEmail"></span>
-        <button class="btn btn-ghost btn-sm" @click="openSettings()">⚙ AI Settings</button>
+        <button class="btn btn-ghost btn-sm" @click="openSettings()"><i class="fa-solid fa-gear"></i> AI Settings</button>
         <button class="btn btn-ghost btn-sm" @click="disconnect">Disconnect</button>
       </div>
     </header>
@@ -91,19 +92,6 @@
             <span class="process-title">INBOX Clean-up</span>
             <span class="status-badge" :class="'badge-' + process.status" x-text="process.status"></span>
           </div>
-          <div class="process-counts">
-            <span x-text="fmt(process.done)"></span>
-            <span class="muted"> / </span>
-            <span x-text="process.total ? fmt(process.total) : '—'"></span>
-            <span class="pct-label" x-show="process.total" x-text="' · ' + pct(process.done, process.total) + '%'"></span>
-          </div>
-        </div>
-
-        <div class="progress-bar">
-          <div class="progress-fill"
-               :class="{ 'progress-fill-done': process.status === 'done' }"
-               :style="{ width: pct(process.done, process.total) + '%' }">
-          </div>
         </div>
 
         <!-- Current action line -->
@@ -118,21 +106,21 @@
         <div class="process-controls">
           <button class="btn btn-primary btn-sm"
             x-show="['idle','stopped'].includes(process.status)"
-            @click="apiPost('/api/process/start')">▶ Start</button>
+            @click="apiPost('/api/process/start')"><i class="fa-solid fa-play"></i> Start</button>
           <button class="btn btn-primary btn-sm"
             x-show="process.status === 'paused'"
-            @click="apiPost('/api/process/resume')">▶ Resume (<span x-text="fmt(process.done)"></span> done)</button>
+            @click="apiPost('/api/process/resume')"><i class="fa-solid fa-play"></i> Resume (<span x-text="fmt(process.done)"></span> done)</button>
           <button class="btn btn-warning btn-sm"
             x-show="process.status === 'running'"
-            @click="apiPost('/api/process/pause')">⏸ Pause</button>
+            @click="apiPost('/api/process/pause')"><i class="fa-solid fa-pause"></i> Pause</button>
           <button class="btn btn-danger btn-sm"
             x-show="['running','paused'].includes(process.status)"
-            @click="apiPost('/api/process/stop')">⏹ Stop</button>
-          <span class="done-label" x-show="process.status === 'done'">✓ Done</span>
+            @click="apiPost('/api/process/stop')"><i class="fa-solid fa-stop"></i> Stop</button>
+          <span class="done-label" x-show="process.status === 'done'"><i class="fa-solid fa-check"></i> Done</span>
           <div style="flex:1"></div>
           <button class="btn btn-ghost btn-sm"
             x-show="!['running','paused'].includes(process.status)"
-            @click="confirmReset()">↺ Reset</button>
+            @click="confirmReset()"><i class="fa-solid fa-rotate-left"></i> Reset</button>
         </div>
       </div>
 
@@ -184,27 +172,47 @@
       </div>
     </div>
 
+    <!-- ── Pipeline Visualizer — live fetch / LLM pool / LLM call state ──── -->
+    <div class="pipeline-card" x-show="['running','paused'].includes(process.status)">
+      <div class="pipeline-row">
+        <span class="pipeline-label">LLM POOL</span>
+        <span class="pipeline-bar" x-text="poolBar()"></span>
+        <span class="pipeline-note muted" x-text="poolStatusText()"></span>
+      </div>
+      <div class="pipeline-row">
+        <span class="pipeline-label">FETCH</span>
+        <span class="pipeline-note muted" x-text="pipeline.fetchTotalChunks ? pipeline.fetchChunk + '/' + pipeline.fetchTotalChunks : '—'"></span>
+        <span class="pipeline-ticker">
+          <template x-for="(tag, idx) in fetchTicker()" :key="idx">[<span :class="'tag-' + tag.action" x-text="tag.letter"></span>]</template>
+        </span>
+      </div>
+      <div class="pipeline-row">
+        <span class="pipeline-label">LLM CALL</span>
+        <span class="pipeline-note" :class="{ 'pipeline-thinking': pipeline.llmState === 'thinking' }" x-text="llmCallText()"></span>
+      </div>
+    </div>
+
     <!-- ── Stats Bar ─────────────────────────────────────────────────── -->
     <div class="stats-bar">
       <div class="stat-item">
-        <span class="stat-icon">📁</span>
+        <span class="stat-icon"><i class="fa-solid fa-folder"></i></span>
         <span class="stat-label">Moved</span>
         <span class="stat-value mov" x-text="fmt(process.moved)"></span>
       </div>
       <div class="stat-item">
-        <span class="stat-icon">🗑</span>
+        <span class="stat-icon"><i class="fa-solid fa-trash"></i></span>
         <span class="stat-label">Deleted</span>
         <span class="stat-value del" x-text="fmt(process.deleted)"></span>
       </div>
       <div class="stat-item">
-        <span class="stat-icon">💾</span>
+        <span class="stat-icon"><i class="fa-solid fa-floppy-disk"></i></span>
         <span class="stat-label">Saved (mbox)</span>
         <span class="stat-value sav" x-text="fmt(process.saved)"></span>
       </div>
       <div class="stat-item">
-        <span class="stat-icon">📬</span>
+        <span class="stat-icon"><i class="fa-solid fa-inbox"></i></span>
         <span class="stat-label">Remaining</span>
-        <span class="stat-value" x-text="process.total ? fmt(Math.max(0, process.total - process.done)) : '—'"></span>
+        <span class="stat-value" x-text="process.grandRemaining !== null ? fmt(process.grandRemaining) : '—'"></span>
       </div>
     </div>
 
@@ -235,13 +243,13 @@
               <div class="feed-subject" x-text="truncate(item.subject, 55)"></div>
               <div class="feed-action">
                 <template x-if="item.action === 'move'">
-                  <span class="tag tag-move">📁 <span x-text="item.folder"></span></span>
+                  <span class="tag tag-move"><i class="fa-solid fa-folder"></i> <span x-text="item.folder"></span></span>
                 </template>
                 <template x-if="item.action === 'delete'">
-                  <span class="tag tag-delete">🗑 DELETE</span>
+                  <span class="tag tag-delete"><i class="fa-solid fa-trash"></i> DELETE</span>
                 </template>
                 <template x-if="item.action === 'save'">
-                  <span class="tag tag-save">💾 mbox</span>
+                  <span class="tag tag-save"><i class="fa-solid fa-floppy-disk"></i> mbox</span>
                 </template>
               </div>
             </div>
@@ -259,7 +267,7 @@
           <div class="folder-list">
             <template x-if="process.deleted > 0">
               <div class="folder-row">
-                <span class="folder-name del">🗑 DELETED</span>
+                <span class="folder-name del"><i class="fa-solid fa-trash"></i> DELETED</span>
                 <div class="folder-bar-wrap">
                   <div class="folder-bar folder-bar-del" :style="{ width: barPct(process.deleted) + '%' }"></div>
                 </div>
@@ -268,7 +276,7 @@
             </template>
             <template x-if="process.saved > 0">
               <div class="folder-row">
-                <span class="folder-name sav">💾 mbox</span>
+                <span class="folder-name sav"><i class="fa-solid fa-floppy-disk"></i> mbox</span>
                 <div class="folder-bar-wrap">
                   <div class="folder-bar folder-bar-sav" :style="{ width: barPct(process.saved) + '%' }"></div>
                 </div>

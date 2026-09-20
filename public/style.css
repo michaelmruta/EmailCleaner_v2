@@ -179,6 +179,38 @@ body {
 .eta-hint      { font-size: 10px; margin-top: 6px; }
 .eta-elapsed   { font-size: 10px; margin-top: 3px; }
 
+/* ── Pipeline Visualizer ─────────────────────────────────────────────── */
+.pipeline-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 20px;
+  margin-bottom: 16px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.pipeline-row {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12px; white-space: nowrap;
+}
+.pipeline-label {
+  color: var(--muted); font-size: 10px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  width: 62px; flex-shrink: 0;
+}
+.pipeline-bar {
+  color: var(--blue); letter-spacing: 1px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.pipeline-note { color: var(--text); flex-shrink: 0; }
+.pipeline-thinking { color: var(--orange); }
+.pipeline-ticker {
+  color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+  letter-spacing: 0.5px; font-weight: 700;
+}
+.tag-move   { color: var(--green); }
+.tag-delete { color: var(--red); }
+.tag-save   { color: var(--teal); }
+
 /* ── Stats Bar ───────────────────────────────────────────────────────── */
 .stats-bar {
   display: grid; grid-template-columns: repeat(4, 1fr);
