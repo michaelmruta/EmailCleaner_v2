@@ -58,9 +58,12 @@ const DOMAIN_RULES = {
   'notifications.linkedin.com': 'DELETE',
   'glassdoor.com': 'DELETE',
   'jobstreet.com.ph': 'DELETE',
+  'jobstreet.com': 'DELETE',
   'kalibrr.com': 'DELETE',
   'indeed.com': 'DELETE',
   'jobsdb.com': 'DELETE',
+  'wellfound.com': 'DELETE',
+  'angel.co': 'DELETE', // Wellfound's former domain (AngelList Talent)
 
   // DELETE: Newsletters / promos known aggressive senders
   'marketing.lazada.com': 'DELETE',
@@ -131,6 +134,10 @@ const KEYWORD_RULES = [
   { match: ['facebook', 'instagram', 'meta platforms', 'meta inc'], folder: 'Facebook' },
   { match: ['twitter', '@x.com', 'x corp'],              folder: 'Twitter' },
   { match: ['tiktok'],                                    folder: 'DELETE' },
+  // Job sites
+  { match: ['linkedin'],                                  folder: 'DELETE' },
+  { match: ['jobstreet'],                                 folder: 'DELETE' },
+  { match: ['wellfound', 'angellist'],                    folder: 'DELETE' },
   // Eleve / condo
   { match: ['eleve', 'first georgetown', 'georgetown ventures', 'fgv'], folder: 'Eleve' },
   // Own company
